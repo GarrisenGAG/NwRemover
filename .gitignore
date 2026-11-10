@@ -1,0 +1,13 @@
+build/
+models/
+downloads/
+tools/
+third_party/
+repo/
+*.log
+*.aex
+*.aep
+*.wav
+*.mp4
+NwRemover.json
+MatCutter.json
