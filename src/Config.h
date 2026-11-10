@@ -10,6 +10,7 @@ struct Config {
     std::string model_file;    // explicit path for "from config" model choice
     std::string groq_api_key;  // single key (legacy)
     std::vector<std::string> groq_api_keys; // key pool (rotated)
+    std::string proxy;         // HTTP proxy for Groq, e.g. http://127.0.0.1:7890
     std::string replacement_sound; // WAV path for "Custom sound" replacement
     std::vector<std::string> custom_words;
     std::vector<std::string> whitelist;

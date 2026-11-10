@@ -219,6 +219,7 @@ static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
         mc::GroqOptions go;
         go.api_key = cfg.groq_api_key;
         go.api_keys = cfg.groq_api_keys;
+        go.proxy = cfg.proxy;
         int gm = (int)params[P_GROQ_MODEL]->u.pd.value;
         go.model = (gm >= 1 && gm <= 2) ? kGroqModels[gm] : "whisper-large-v3";
         go.language = lang;

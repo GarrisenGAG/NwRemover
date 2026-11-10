@@ -9,6 +9,7 @@ namespace mc {
 struct GroqOptions {
     std::string api_key;                 // single key (legacy)
     std::vector<std::string> api_keys;   // pool, rotated round-robin
+    std::string proxy;                   // HTTP proxy, e.g. http://127.0.0.1:7890
     std::string model = "whisper-large-v3";
     std::string language = "ru"; // "auto" -> omit
 };

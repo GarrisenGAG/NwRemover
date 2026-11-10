@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 
 namespace mc {
@@ -14,6 +15,25 @@ static std::wstring to_wide(const std::string& s) {
     std::wstring w(n, 0);
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
+}
+
+static std::wstring strip_scheme(const std::string& u) {
+    std::string s = u;
+    size_t p = s.find("://");
+    if (p != std::string::npos) s = s.substr(p + 3);
+    while (!s.empty() && s.back() == '/') s.pop_back();
+    return to_wide(s);
+}
+
+// Proxy precedence: config -> HTTPS_PROXY/https_proxy/HTTP_PROXY/http_proxy -> none (automatic).
+static std::wstring effective_proxy(const GroqOptions& opt) {
+    if (!opt.proxy.empty()) return strip_scheme(opt.proxy);
+    const char* envs[] = {"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"};
+    for (const char* e : envs) {
+        const char* v = getenv(e);
+        if (v && *v) return strip_scheme(v);
+    }
+    return L"";
 }
 
 static void append(std::vector<uint8_t>& v, const std::string& s) {
@@ -28,10 +48,13 @@ struct HttpResult {
 };
 
 static HttpResult do_request(const std::string& api_key, const std::string& boundary,
-                             const std::vector<uint8_t>& body) {
+                             const std::vector<uint8_t>& body, const std::wstring& proxy_hostport) {
     HttpResult r;
-    HINTERNET hSession = WinHttpOpen(L"MatCutter/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    DWORD access = proxy_hostport.empty() ? WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+                                          : WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+    HINTERNET hSession = WinHttpOpen(L"NwRemover/1.0", access,
+                                     proxy_hostport.empty() ? WINHTTP_NO_PROXY_NAME : proxy_hostport.c_str(),
+                                     WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) { r.error = "WinHttpOpen failed"; return r; }
     WinHttpSetTimeouts(hSession, 10000, 15000, 60000, 120000);
     HINTERNET hConnect = WinHttpConnect(hSession, L"api.groq.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -95,10 +118,11 @@ AnalysisResult transcribe_groq(const std::vector<float>& mono16k, const GroqOpti
 
     size_t nkeys = keys.size();
     size_t start = g_key_index.fetch_add(1) % nkeys;
+    std::wstring proxy = effective_proxy(opt);
     std::string last_err;
     for (size_t i = 0; i < nkeys; i++) {
         const std::string& key = keys[(start + i) % nkeys];
-        HttpResult hr = do_request(key, b, body);
+        HttpResult hr = do_request(key, b, body, proxy);
         if (!hr.sent) { last_err = hr.error; continue; }
         if (hr.status == 200) {
             auto j = nlohmann::json::parse(hr.resp, nullptr, false);

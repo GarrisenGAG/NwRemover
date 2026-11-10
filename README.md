@@ -66,6 +66,7 @@
 - или один ключ в `groq_api_key`
 - в эффекте выбери Backend = Groq API
 - ключи начинаются с `gsk_`
+- groq блокирует некоторые регионы, если напрямую ошибка 403 Forbidden, пропиши прокси в конфиге поле `proxy`, например `http://127.0.0.1:7890`. если поле пустое, плагин берёт прокси из переменной окружения `HTTPS_PROXY`
 
 если у тебя файл с ключами вида `GROQ_API_KEY_1=gsk_...`, импортируй их одной командой:
 
@@ -81,6 +82,7 @@ python import_groq_keys.py C:\путь\groq.txt
 {
   "models_dir": "D:/AEplugin/models",
   "groq_api_keys": ["gsk_твойключ1", "gsk_твойключ2"],
+  "proxy": "http://127.0.0.1:7890",
   "replacement_sound": "D:/звуки/boing.wav",
   "custom_words": ["моёслово"],
   "whitelist": ["имя"]

@@ -3,6 +3,7 @@
   "model_file": "",
   "groq_api_key": "",
   "groq_api_keys": [],
+  "proxy": "",
   "replacement_sound": "",
   "custom_words": [],
   "whitelist": []

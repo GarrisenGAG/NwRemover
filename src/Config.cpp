@@ -40,6 +40,7 @@ Config load_config(const std::string& plugin_dir) {
             if (j.contains("groq_api_keys") && j["groq_api_keys"].is_array())
                 for (auto& v : j["groq_api_keys"]) if (v.is_string() && !v.get<std::string>().empty()) cfg.groq_api_keys.push_back(v.get<std::string>());
             if (j.contains("replacement_sound") && j["replacement_sound"].is_string()) cfg.replacement_sound = j["replacement_sound"].get<std::string>();
+            if (j.contains("proxy") && j["proxy"].is_string()) cfg.proxy = j["proxy"].get<std::string>();
             if (j.contains("custom_words") && j["custom_words"].is_array())
                 for (auto& v : j["custom_words"]) if (v.is_string()) cfg.custom_words.push_back(v.get<std::string>());
             if (j.contains("whitelist") && j["whitelist"].is_array())
