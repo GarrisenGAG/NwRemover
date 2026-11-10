@@ -1,76 +1,116 @@
 # NwRemover
 
-плагин для after effects, автоматически находит мат в аудиодорожке и заменяет его. распознавание через локальный whisper.cpp или groq api
+плагин для after effects, сам находит мат в аудиодорожке и заглушает его. ты выбираешь площадку и чем заменить мат
 
-## возможности
+## скачать
 
-- два бэкенда, локальный whisper.cpp (приоритет) и groq api
-- пресеты платформ youtube, tiktok, reels, twitch, задают строгость словаря
-- замена на бип, тишину, реверс, питч-шифт или свой звук
-- свой звук замены, любой wav, зацикливается на зону мата
-- ручной мут ползунком, глушит выбранный момент поверх автодетекций
-- словарь русского мата и английского, три уровня строгости, whitelist
-- пул groq-ключей с ротацией и fallback на 429/401
-- питч бипа, свип, форма волны, громкость, fade
-- padding и merge зазоров между вырезками
-- вырезки сохраняются в проекте
+- качай `NwRemover.aex` из [релиза](https://github.com/GarrisenGAG/NwRemover/releases/latest)
+- для распознавания нужна модель whisper, запусти `download_models.cmd base` (или `download_models.cmd tiny` для быстрой модели)
 
 ## установка
 
-- скачай NwRemover.aex из релиза
-- положи в `C:\Program Files\Adobe\Adobe After Effects 20XX\Support Files\Plug-ins`
-- скачай модели whisper через `download_models.cmd base`, tiny и base нужны для старта
-- модели кладутся в `D:\AEplugin\models` или в каталог `models` рядом с плагином
+- закрой after effects
+- скопируй `NwRemover.aex` в папку плагинов
+  `C:\Program Files\Adobe\Adobe After Effects 20XX\Support Files\Plug-ins`
+- модели из `download_models.cmd` кладутся в `D:\AEplugin\models`. хочешь другую папку, создай `models` рядом с плагином или пропиши путь в конфиге
+- запусти after effects
 
-## использование
+## как пользоваться
 
-- примени эффект NwRemover (категория Audio) к аудиослою
-- выбери backend, модель, язык
-- выбери пресет платформы или настрой строгость вручную
-- нажми Analyze либо включи Auto-analyze on render
-- выбери замену и её настройки
-- для своего звука пропиши `replacement_sound` в NwRemover.json
-- для groq впиши ключи в NwRemover.json, массив `groq_api_keys`
-- кнопка Report показывает найденные слова с таймкодами
+- выдели слой со звуком
+- Effect → Audio → NwRemover
+- Backend: Local (whisper.cpp) для работы без интернета, Groq API если есть ключ
+- Platform preset: выбери свою площадку
+- нажми Analyze, плагин распознает дорожку и найдет мат
+  (или включи Auto-analyze on render, анализ запустится сам при рендере)
+- Replace with: выбери чем заменить мат
+- Report покажет список найденных слов с таймкодами
+- делаешь превью или рендер, мат заменен
 
-## конфиг NwRemover.json
+## пресеты площадок
 
-лежит рядом с плагином или в `D:\AEplugin`. поля:
+- YouTube, для монетизации, режет крепкий и средний мат
+- TikTok и Reels, самые строгие, режут еще и мягкие слова
+- Twitch, мягче всего, режет только жесткий мат и оскорбления
+- Custom, сам задаешь строгость слайдером Strictness
 
-- `models_dir`, каталог моделей whisper
-- `model_file`, явный путь модели для выбора from config
-- `groq_api_key`, один ключ
-- `groq_api_keys`, массив ключей, ротация round-robin
-- `replacement_sound`, wav для режима Custom sound
-- `custom_words`, свои слова в словарь
-- `whitelist`, глобальные исключения
+## чем заменить мат
 
-импорт ключей из формата `GROQ_API_KEY_N=gsk_...`:
+- Beep, классический писк. частота, форма (sine/square/saw), свип, громкость
+- Silence, тишина
+- Reverse, прокручивает кусок задом наперед
+- Pitch shift, понижает или повышает голос на куске
+- Custom sound, твой wav вместо мата. путь к файлу пропиши в конфиге
+
+## ручной мут
+
+если плагин что-то пропустил или сработал не там:
+
+- включи Enable manual mute
+- Mute at (sec), момент в секундах
+- Mute length (ms), сколько глушить
+- этот кусок заглушится поверх автоматических находок
+
+## свои слова и исключения
+
+в конфиге `NwRemover.json`:
+
+- `custom_words`, добавить свои слова в словарь
+- `whitelist`, слова которые никогда не считать матом
+
+## groq api
+
+чтобы распознавать через groq вместо локальной модели:
+
+- впиши ключи в конфиг, поле `groq_api_keys` (можно несколько, плагин сам их чередует)
+- или один ключ в `groq_api_key`
+- в эффекте выбери Backend = Groq API
+- ключи начинаются с `gsk_`
+
+если у тебя файл с ключами вида `GROQ_API_KEY_1=gsk_...`, импортируй их одной командой:
 
 ```
-python import_groq_keys.py C:\path\groq.txt
+python import_groq_keys.py C:\путь\groq.txt
 ```
 
-## сборка
+## где конфиг
 
-нужны gcc (msys2 ucrt64), cmake, ninja. third_party не в репо, склонируй отдельно:
-
-- https://github.com/ggml-org/whisper.cpp в `third_party/whisper.cpp`
-- https://github.com/Trentonom0r3/AETK в `third_party/AETK` (заголовки AE SDK)
-
-whisper.cpp собирается без AVX2/BMI2/FMA/F16C под старые cpu:
+`NwRemover.json` лежит рядом с плагином или в `D:\AEplugin`. открой его блокнотом. пример:
 
 ```
-cmake -S third_party/whisper.cpp -B build/whisper -G Ninja -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_BMI2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF
-cmake --build build/whisper --target whisper
-cmake -S . -B build/plugin -G Ninja -DCMAKE_RC_COMPILER=<ucrt64>/windres.exe
-cmake --build build/plugin
+{
+  "models_dir": "D:/AEplugin/models",
+  "groq_api_keys": ["gsk_твойключ1", "gsk_твойключ2"],
+  "replacement_sound": "D:/звуки/boing.wav",
+  "custom_words": ["моёслово"],
+  "whitelist": ["имя"]
+}
 ```
 
-PiPL-ресурс генерирует `pipl_gen.py` в `NwRemover.rc`. плагин собирается gcc-MinGW без MSVC, интерфейс AE это C-ABI x64
+## настройки распознавания
 
-## тесты
+- Model, размер модели. tiny быстрая, base точнее, large-v3 самая точная и медленная. для русского бери base или выше
+- Language, язык дорожки. ru для русского, auto если смешанный
+- Threads, потоки cpu, ставь 4-8
+- Padding, миллисекунды вокруг слова чтобы наверняка перекрыть
+- Merge gap, склеивать соседние находки если зазор меньше этого
 
-- `test_pipeline dict`, словарь и уровни строгости
-- `test_host`, загрузка .aex, PiPL, GLOBAL_SETUP
-- `test_pipeline <wav> <model> <lang> <out> <mode> [sound.wav]`, полный прогон, mode 1 бип 2 тишина 3 реверс 4 питч 5 свой звук
+## советы
+
+- mat не распознался, возьми модель крупнее (base → small → medium) или groq
+- для быстрого результата бери tiny
+- плагин не меняет длительность звука, только глушит и заменяет куски
+- для монетизации youtube важнее всего первые 30 секунд, проверяй их
+
+## если что-то не так
+
+- эффекта нет в меню, проверь что .aex в Plug-ins и after effects перезапушен
+- Analyze пишет ошибку про модель, скачай модель через download_models.cmd и проверь путь models_dir
+- groq ошибка про ключ, проверь что ключи вписаны в groq_api_keys и начинаются с gsk_
+- нет звука на слое, плагин работает только со слоями где есть аудио
+
+## заметки
+
+- groq-путь написан, вживую не проверен, нужны ключи
+- точность зависит от модели, base может ошибаться на сложном мате
+- проверено на AE 2023
