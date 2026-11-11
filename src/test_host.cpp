@@ -37,7 +37,7 @@ int main() {
     std::printf("GLOBAL_SETUP err=%d out_flags=0x%08lx out_flags2=0x%08lx my_version=%lu\n",
                 (int)err, (unsigned long)out.out_flags, (unsigned long)out.out_flags2,
                 (unsigned long)out.my_version);
-    if (err != 0 || out.out_flags != 0x98000000UL) { std::printf("GLOBAL_SETUP BAD\n"); return 5; }
+    if (err != 0 || out.out_flags != 0x9C000000UL) { std::printf("GLOBAL_SETUP BAD\n"); return 5; }
 
     std::printf("HOST TEST PASS\n");
     FreeLibrary(hm);

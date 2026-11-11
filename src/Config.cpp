@@ -65,4 +65,42 @@ std::string resolve_model_path(const Config& cfg, int model_choice) {
     return join(cfg.models_dir, names[model_choice]);
 }
 
+bool add_groq_key(const std::string& plugin_dir, const std::string& key) {
+    std::string p1 = join(plugin_dir, "NwRemover.json");
+    std::string p2 = "D:/AEplugin/NwRemover.json";
+    std::string path = file_exists(p1) ? p1 : p2;
+    nlohmann::json j = nlohmann::json::object();
+    std::string body = read_file(path);
+    if (!body.empty()) {
+        auto parsed = nlohmann::json::parse(body, nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) j = parsed;
+    }
+    auto& arr = j["groq_api_keys"];
+    if (!arr.is_array()) arr = nlohmann::json::array();
+    for (auto& v : arr)
+        if (v.is_string() && v.get<std::string>() == key) return true; // already present
+    arr.push_back(key);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f << j.dump(2) << "\n";
+    return (bool)f;
+}
+
+bool set_models_dir(const std::string& plugin_dir, const std::string& dir) {
+    std::string p1 = join(plugin_dir, "NwRemover.json");
+    std::string p2 = "D:/AEplugin/NwRemover.json";
+    std::string path = file_exists(p1) ? p1 : p2;
+    nlohmann::json j = nlohmann::json::object();
+    std::string body = read_file(path);
+    if (!body.empty()) {
+        auto parsed = nlohmann::json::parse(body, nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) j = parsed;
+    }
+    j["models_dir"] = dir;
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f << j.dump(2) << "\n";
+    return (bool)f;
+}
+
 } // namespace mc

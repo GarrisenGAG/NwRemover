@@ -1,6 +1,7 @@
 // NwRemover - After Effects audio effect: auto-censor profanity via local
 // whisper.cpp or Groq API. Platform presets, custom replacement sound, manual mute.
 #include <windows.h>
+#include <shlobj.h>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -16,9 +17,12 @@
 #include "entry.h"
 #include "AE_Effect.h"
 #include "AE_EffectCB.h"
+#include "AE_EffectUI.h"
+#include "AE_EffectSuites.h"
 #include "AE_EffectVers.h"
 #include "AE_Macros.h"
 #include "Param_Utils.h"
+#include "SP/SPBasic.h"
 
 #include "Analysis.h"
 #include "Profanity.h"
@@ -36,10 +40,14 @@
 enum {
     P_INPUT = 0,
     P_ENABLE,
+    P_STATUS,
+    P_INFO,
     P_TOPIC_ANALYSIS,
     P_BACKEND,
     P_MODEL,
+    P_MODELDIR,
     P_GROQ_MODEL,
+    P_APIKEY,
     P_LANGUAGE,
     P_THREADS,
     P_AUTO,
@@ -121,6 +129,11 @@ static std::wstring to_wide(const std::string& s) {
 static const char* kLanguages[] = {"auto","ru","en","uk","be","de","fr","es","it","pl","tr","ja","ko","zh"};
 static const char* kGroqModels[] = {"", "whisper-large-v3", "whisper-large-v3-turbo"};
 
+// cancel flag for whisper (read from ggml worker threads, set from the calling thread)
+static std::atomic<bool> g_analysis_cancel{false};
+static void update_param_name(PF_InData* in_data, PF_ParamDef* params[],
+                              PF_ParamIndex idx, const char* name);
+
 // Platform preset -> max dictionary severity (1 severe, 2 medium, 3 mild).
 static int platform_severity(int platform_popup, int strictness_slider) {
     switch (platform_popup) {
@@ -199,13 +212,14 @@ static bool checkout_mono16k(PF_InData* in_data, A_long start, A_long dur,
 }
 
 static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
-                                const std::vector<float>& mono16k, double dur) {
+                                const std::vector<float>& mono16k, double dur, bool show_status) {
     mc::Config cfg = mc::load_config(plugin_dir());
     mc::Dictionary dict = mc::default_dictionary();
     for (auto& w : cfg.custom_words) dict.add(w, {}, 1);
     for (auto& w : cfg.whitelist) dict.global_whitelist.push_back(mc::normalize_word(w));
     dict.max_severity = platform_severity((int)params[P_PLATFORM]->u.pd.value,
                                           (int)params[P_STRICTNESS]->u.sd.value);
+    if (show_status) update_param_name(in_data, params, P_STATUS, "Status: analyzing...");
 
     int backend = (int)params[P_BACKEND]->u.pd.value;
     int lang_idx = (int)params[P_LANGUAGE]->u.pd.value;
@@ -229,15 +243,38 @@ static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
         opt.model_path = mc::resolve_model_path(cfg, (int)params[P_MODEL]->u.pd.value);
         opt.language = lang;
         opt.threads = (int)params[P_THREADS]->u.sd.value;
+        g_analysis_cancel = false;
+        // progress_callback fires on the whisper_full calling thread (safe for AE),
+        // abort_callback fires inside ggml worker threads and only reads the atomic.
+        opt.progress = [in_data](int p){
+            if (PF_ABORT(in_data) != PF_Err_NONE) g_analysis_cancel = true;
+            PF_PROGRESS(in_data, p, 100);
+        };
+        opt.abort = []()->bool { return g_analysis_cancel.load(); };
         r = mc::transcribe_local(mono16k.data(), mono16k.size(), opt);
     }
-    if (!r.ok) { log_line("ANALYSIS ERROR: " + r.error); return r.error; }
+    if (!r.ok) {
+        log_line("ANALYSIS ERROR: " + r.error);
+        if (show_status) {
+            update_param_name(in_data, params, P_STATUS, "Status: error");
+            std::string info = "Info: " + r.error;
+            if (info.size() > 90) info.resize(90);
+            update_param_name(in_data, params, P_INFO, info.c_str());
+        }
+        return r.error;
+    }
     auto cuts = mc::build_cuts(r.words, dict, pad, merge);
     store_cuts(in_data, cuts, 16000.0, dur);
     log_line("ANALYSIS OK backend=" + std::to_string(backend) + " severity=" + std::to_string(dict.max_severity) +
              " words=" + std::to_string(r.words.size()) + " cuts=" + std::to_string(cuts.size()) + " dur=" + std::to_string(dur));
     for (auto& c : cuts)
         log_line("  cut " + std::to_string(c.start) + "-" + std::to_string(c.end) + " [" + c.word + "]");
+    if (show_status) {
+        update_param_name(in_data, params, P_STATUS, "Status: done");
+        char ibuf[128];
+        std::snprintf(ibuf, sizeof(ibuf), "Info: %zu cuts from %zu words", cuts.size(), r.words.size());
+        update_param_name(in_data, params, P_INFO, ibuf);
+    }
     char buf[128];
     std::snprintf(buf, sizeof(buf), "OK: %zu words, %zu cuts", r.words.size(), cuts.size());
     return std::string(buf);
@@ -261,6 +298,246 @@ static std::wstring report_text(PF_InData* in_data) {
     return out;
 }
 
+// ---- runtime UI updates via PF Param Utils Suite ----
+static PF_ParamUtilsSuite3* acquire_param_suite(PF_InData* in_data) {
+    if (!in_data->pica_basicP) return nullptr;
+    PF_ParamUtilsSuite3* s = nullptr;
+    if ((*in_data->pica_basicP->AcquireSuite)(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3,
+                                              (const void**)&s) != 0 || !s) return nullptr;
+    return s;
+}
+static void release_param_suite(PF_InData* in_data, PF_ParamUtilsSuite3* s) {
+    if (in_data->pica_basicP && s)
+        (*in_data->pica_basicP->ReleaseSuite)(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3);
+}
+
+// Change a param's displayed name (status labels). Cosmetic only, no undo entry.
+static void update_param_name(PF_InData* in_data, PF_ParamDef* params[],
+                              PF_ParamIndex idx, const char* name) {
+    if (!params || !params[idx]) return;
+    PF_ParamUtilsSuite3* s = acquire_param_suite(in_data);
+    if (!s || !s->PF_UpdateParamUI) { release_param_suite(in_data, s); return; }
+    PF_ParamDef def = *params[idx];
+    PF_STRNNCPY(def.name, name, sizeof(def.name));
+    (*s->PF_UpdateParamUI)(in_data->effect_ref, idx, &def);
+    release_param_suite(in_data, s);
+}
+
+// Gray out params that do not belong to the selected backend.
+// (PF_PUI_INVISIBLE is ignored by the AE Effect Controls panel; PF_PUI_DISABLED works.)
+static void update_backend_ui(PF_InData* in_data, PF_ParamDef* params[]) {
+    if (!params || !params[P_BACKEND]) return;
+    PF_ParamUtilsSuite3* s = acquire_param_suite(in_data);
+    static std::atomic<bool> logged{false};
+    if (!s || !s->PF_UpdateParamUI) {
+        if (!logged.exchange(true)) log_line("BACKEND_UI: param utils suite unavailable");
+        release_param_suite(in_data, s);
+        return;
+    }
+    bool local = ((int)params[P_BACKEND]->u.pd.value == 1);
+    const PF_ParamIndex list[] = { P_MODEL, P_MODELDIR, P_THREADS, P_GROQ_MODEL, P_APIKEY };
+    for (PF_ParamIndex idx : list) {
+        if (!params[idx]) continue;
+        PF_ParamDef def = *params[idx];
+        bool show = (idx == P_MODEL || idx == P_MODELDIR || idx == P_THREADS) ? local : !local;
+        if (show) def.ui_flags &= ~PF_PUI_DISABLED;
+        else def.ui_flags |= PF_PUI_DISABLED;
+        (*s->PF_UpdateParamUI)(in_data->effect_ref, idx, &def);
+    }
+    release_param_suite(in_data, s);
+    if (!logged.exchange(true)) log_line(std::string("BACKEND_UI: applied local=") + (local ? "1" : "0"));
+}
+
+static std::string to_utf8(const std::wstring& w) {
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// ---- Win32 dialogs ----
+struct ApiKeyCtx { std::wstring value; bool ok = false; };
+
+static LRESULT CALLBACK apikey_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        ApiKeyCtx* ctx = (ApiKeyCtx*)((LPCREATESTRUCTW)l)->lpCreateParams;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)ctx);
+        HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HWND lbl = CreateWindowExW(0, L"STATIC", L"Groq API key (gsk_...):",
+            WS_CHILD | WS_VISIBLE, 12, 12, 380, 20, h, NULL, NULL, NULL);
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            12, 36, 392, 24, h, (HMENU)1001, NULL, NULL);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 216, 72, 92, 28, h, (HMENU)IDOK, NULL, NULL);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"Отмена",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 316, 72, 92, 28, h, (HMENU)IDCANCEL, NULL, NULL);
+        SendMessageW(lbl, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(edit, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(cancel, WM_SETFONT, (WPARAM)f, TRUE);
+        SetFocus(edit);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL) {
+            ApiKeyCtx* ctx = (ApiKeyCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (LOWORD(w) == IDOK && ctx) {
+                int len = GetWindowTextLengthW(GetDlgItem(h, 1001));
+                std::vector<wchar_t> buf(len + 1, 0);
+                GetDlgItemTextW(h, 1001, buf.data(), len + 1);
+                ctx->value = buf.data();
+                ctx->ok = true;
+            }
+            DestroyWindow(h);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static bool api_key_input_dialog(std::wstring& out) {
+    static const wchar_t* cls = L"NwRemoverKeyBox";
+    WNDCLASSW wc = {};
+    if (!GetClassInfoW(NULL, cls, &wc)) {
+        wc.lpfnWndProc = apikey_wndproc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = cls;
+        RegisterClassW(&wc);
+    }
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int w = 430, hgt = 140;
+    int x = wa.left + ((wa.right - wa.left) - w) / 2;
+    int y = wa.top + ((wa.bottom - wa.top) - hgt) / 2;
+    ApiKeyCtx ctx;
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_CONTROLPARENT, cls,
+        L"NwRemover - Groq API key",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        x, y, w, hgt, NULL, NULL, GetModuleHandleW(NULL), &ctx);
+    if (!hwnd) return false;
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    MSG m;
+    while (IsWindow(hwnd) && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    if (ctx.ok) out = ctx.value;
+    return ctx.ok;
+}
+
+// Folder picker for the models directory (shell browse).
+static bool folder_pick_dialog(std::wstring& out) {
+    bool com_here = false;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(hr)) com_here = true; // S_OK or S_FALSE: balanced CoUninitialize
+    bool ok = false;
+    BROWSEINFOW bi = {};
+    wchar_t title[128];
+    swprintf(title, 128, L"NwRemover: папка с моделями whisper (ggml-*.bin)");
+    bi.hwndOwner = NULL;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (pidl) {
+        wchar_t path[MAX_PATH] = {0};
+        if (SHGetPathFromIDListW(pidl, path)) { out = path; ok = true; }
+        CoTaskMemFree(pidl);
+    }
+    if (com_here) CoUninitialize();
+    return ok;
+}
+
+struct ReportCtx { std::wstring text; };
+
+static LRESULT CALLBACK report_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        ReportCtx* ctx = (ReportCtx*)((LPCREATESTRUCTW)l)->lpCreateParams;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)ctx);
+        HFONT f = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            12, 12, 500, 320, h, (HMENU)2001, NULL, NULL);
+        HWND copy = CreateWindowExW(0, L"BUTTON", L"Копировать",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 306, 344, 100, 28, h, (HMENU)2002, NULL, NULL);
+        HWND close = CreateWindowExW(0, L"BUTTON", L"Закрыть",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 414, 344, 100, 28, h, (HMENU)IDCANCEL, NULL, NULL);
+        SendMessageW(edit, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(copy, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(close, WM_SETFONT, (WPARAM)f, TRUE);
+        SetWindowTextW(edit, ctx->text.c_str());
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == 2002) { // copy to clipboard
+            ReportCtx* ctx = (ReportCtx*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (ctx && OpenClipboard(h)) {
+                EmptyClipboard();
+                SIZE_T bytes = (ctx->text.size() + 1) * sizeof(wchar_t);
+                HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                if (g) {
+                    memcpy(GlobalLock(g), ctx->text.c_str(), bytes);
+                    GlobalUnlock(g);
+                    SetClipboardData(CF_UNICODETEXT, g);
+                }
+                CloseClipboard();
+            }
+            return 0;
+        }
+        if (LOWORD(w) == IDCANCEL) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void show_report_dialog(const std::wstring& text) {
+    static const wchar_t* cls = L"NwRemoverReportBox";
+    WNDCLASSW wc = {};
+    if (!GetClassInfoW(NULL, cls, &wc)) {
+        wc.lpfnWndProc = report_wndproc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = cls;
+        RegisterClassW(&wc);
+    }
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int w = 540, hgt = 420;
+    int x = wa.left + ((wa.right - wa.left) - w) / 2;
+    int y = wa.top + ((wa.bottom - wa.top) - hgt) / 2;
+    ReportCtx ctx{ text };
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_CONTROLPARENT, cls,
+        L"NwRemover - отчёт по вырезкам",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        x, y, w, hgt, NULL, NULL, GetModuleHandleW(NULL), &ctx);
+    if (!hwnd) return;
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    MSG m;
+    while (IsWindow(hwnd) && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+}
+
 static PF_Err About(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
     PF_SPRINTF(out_data->return_msg, "%s v1.0\n%s", NC_NAME, NC_DESCRIPTION);
     return PF_Err_NONE;
@@ -268,7 +545,8 @@ static PF_Err About(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*[], PF
 
 static PF_Err GlobalSetup(PF_InData*, PF_OutData* out_data, PF_ParamDef*[], PF_LayerDef*) {
     out_data->my_version = PF_VERSION(1, 0, 0, PF_Stage_RELEASE, 1);
-    out_data->out_flags  = PF_OutFlag_AUDIO_EFFECT_ONLY | PF_OutFlag_AUDIO_FLOAT_ONLY | PF_OutFlag_AUDIO_IIR;
+    out_data->out_flags  = PF_OutFlag_AUDIO_EFFECT_ONLY | PF_OutFlag_AUDIO_FLOAT_ONLY | PF_OutFlag_AUDIO_IIR
+                         | PF_OutFlag_SEND_UPDATE_PARAMS_UI;
     out_data->out_flags2 = PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
     return PF_Err_NONE;
 }
@@ -277,11 +555,48 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_ParamDef def;
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Enable", TRUE, 0, P_ENABLE);
+    // Status labels: AE renders PF_Param_NO_DATA as nothing, so use disabled
+    // checkboxes (grayed) whose names we rewrite at runtime via UpdateParamUI.
+    // AE requires u.bd.u.nameptr to be set for every checkbox (validation).
+    static const char kSpaceName[] = " ";
+    {
+        AEFX_CLR_STRUCT(def);
+        def.param_type = PF_Param_CHECKBOX;
+        PF_STRNNCPY(def.name, "Status: ready", sizeof(def.name));
+        def.u.bd.u.nameptr = kSpaceName;
+        def.u.bd.value = def.u.bd.dephault = FALSE;
+        def.ui_flags = PF_PUI_DISABLED;
+        def.uu.id = P_STATUS;
+        PF_ADD_PARAM(in_data, -1, &def);
+        AEFX_CLR_STRUCT(def);
+        def.param_type = PF_Param_CHECKBOX;
+        def.name[0] = 0;
+        def.u.bd.u.nameptr = kSpaceName;
+        def.u.bd.value = def.u.bd.dephault = FALSE;
+        def.ui_flags = PF_PUI_DISABLED;
+        def.uu.id = P_INFO;
+        PF_ADD_PARAM(in_data, -1, &def);
+    }
 
     PF_ADD_TOPIC("Analysis", P_TOPIC_ANALYSIS);
-    PF_ADD_POPUP("Backend", 2, 1, "Local (whisper.cpp)|Groq API", P_BACKEND);
+    // Backend popup written manually: needs PF_ParamFlag_SUPERVISE so that
+    // switching it fires USER_CHANGED_PARAM and we show/hide backend params.
+    AEFX_CLR_STRUCT(def);
+    def.param_type = PF_Param_POPUP;
+    PF_STRNNCPY(def.name, "Backend", sizeof(def.name));
+    def.u.pd.num_choices = 2;
+    def.u.pd.value = def.u.pd.dephault = 1;
+    def.u.pd.u.namesptr = "Local (whisper.cpp)|Groq API";
+    def.flags = PF_ParamFlag_SUPERVISE;
+    def.uu.id = P_BACKEND;
+    {
+        PF_Err priv_err = PF_ADD_PARAM(in_data, -1, &def);
+        if (priv_err) return priv_err;
+    }
     PF_ADD_POPUP("Model (local)", 6, 2, "tiny|base|small|medium|large-v3|from config", P_MODEL);
+    PF_ADD_BUTTON("", "Models folder...", 0, PF_ParamFlag_SUPERVISE, P_MODELDIR);
     PF_ADD_POPUP("Model (Groq)", 2, 1, "whisper-large-v3|whisper-large-v3-turbo", P_GROQ_MODEL);
+    PF_ADD_BUTTON("", "API key...", 0, PF_ParamFlag_SUPERVISE, P_APIKEY);
     PF_ADD_POPUP("Language", 14, 2, "auto|ru|en|uk|be|de|fr|es|it|pl|tr|ja|ko|zh", P_LANGUAGE);
     PF_ADD_SLIDER("Threads", 1, 16, 1, 16, 4, P_THREADS);
     PF_ADD_CHECKBOXX("Auto-analyze on render", FALSE, 0, P_AUTO);
@@ -344,13 +659,47 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
     auto* e = (PF_UserChangedParamExtra*)extra;
     if (!e) return PF_Err_NONE;
 
+    if (e->param_index == P_BACKEND) update_backend_ui(in_data, params);
+
     if (e->param_index == P_CLEAR) {
         SeqData* s = seq_lock(in_data);
         if (s) { s->num_cuts = 0; s->pending = 0; s->analyzed = 0; seq_unlock(in_data); }
         return PF_Err_NONE;
     }
     if (e->param_index == P_REPORT) {
-        MessageBoxW(nullptr, report_text(in_data).c_str(), L"NwRemover report", MB_OK | MB_ICONINFORMATION);
+        show_report_dialog(report_text(in_data));
+        return PF_Err_NONE;
+    }
+    if (e->param_index == P_APIKEY) {
+        std::wstring wkey;
+        if (!api_key_input_dialog(wkey)) return PF_Err_NONE;
+        std::string key = to_utf8(wkey);
+        while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) key.erase(key.begin());
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t' || key.back() == '\r' || key.back() == '\n')) key.pop_back();
+        if (key.rfind("gsk_", 0) != 0 || key.size() < 20) {
+            MessageBoxW(nullptr, L"Ключ должен начинаться с gsk_ и быть полным.", L"NwRemover", MB_OK | MB_ICONWARNING);
+            return PF_Err_NONE;
+        }
+        if (!mc::add_groq_key(plugin_dir(), key)) {
+            MessageBoxW(nullptr, L"Не удалось записать NwRemover.json", L"NwRemover", MB_OK | MB_ICONERROR);
+            return PF_Err_NONE;
+        }
+        mc::Config cfg = mc::load_config(plugin_dir());
+        wchar_t msg[160];
+        swprintf(msg, 160, L"Ключ сохранён в NwRemover.json\nКлючей в пуле: %zu", cfg.groq_api_keys.size());
+        MessageBoxW(nullptr, msg, L"NwRemover", MB_OK | MB_ICONINFORMATION);
+        return PF_Err_NONE;
+    }
+    if (e->param_index == P_MODELDIR) {
+        std::wstring wdir;
+        if (!folder_pick_dialog(wdir)) return PF_Err_NONE;
+        std::string dir = to_utf8(wdir);
+        if (!mc::set_models_dir(plugin_dir(), dir)) {
+            MessageBoxW(nullptr, L"Не удалось записать NwRemover.json", L"NwRemover", MB_OK | MB_ICONERROR);
+            return PF_Err_NONE;
+        }
+        std::string info = "Info: models " + dir;
+        update_param_name(in_data, params, P_INFO, info.c_str());
         return PF_Err_NONE;
     }
     if (e->param_index == P_ANALYZE) {
@@ -358,7 +707,7 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
         bool got = checkout_mono16k(in_data, 0, in_data->total_time, in_data->time_scale, mono);
         if (got) {
             double dur = mono.size() / 16000.0;
-            std::string res = run_analysis(in_data, params, mono, dur);
+            std::string res = run_analysis(in_data, params, mono, dur, true);
             std::wstring msg = to_wide(res);
             if (res.rfind("OK:", 0) == 0)
                 MessageBoxW(nullptr, (L"Analysis complete.\n" + msg).c_str(), L"NwRemover", MB_OK | MB_ICONINFORMATION);
@@ -390,7 +739,7 @@ static PF_Err AudioSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* 
     if (pending || (auto_on && !analyzed)) {
         std::vector<float> mono;
         if (checkout_mono16k(in_data, 0, in_data->total_sampL, in_data->time_scale, mono)) {
-            std::string res = run_analysis(in_data, params, mono, mono.size() / 16000.0);
+            std::string res = run_analysis(in_data, params, mono, mono.size() / 16000.0, false);
             if (res.rfind("OK:", 0) != 0) {
                 SeqData* s2 = seq_lock(in_data);
                 if (s2) { s2->pending = 0; s2->analyzed = 1; seq_unlock(in_data); }
@@ -525,6 +874,7 @@ extern "C" __declspec(dllexport) PF_Err EffectMain(
     case PF_Cmd_SEQUENCE_SETDOWN: return SequenceSetdown(in_data, out_data, params, output);
     case PF_Cmd_SEQUENCE_RESETUP: return SequenceResetup(in_data, out_data, params, output);
     case PF_Cmd_USER_CHANGED_PARAM: return UserChangedParam(in_data, out_data, params, output, extra);
+    case PF_Cmd_UPDATE_PARAMS_UI:   update_backend_ui(in_data, params); return PF_Err_NONE;
     case PF_Cmd_AUDIO_SETUP:      return AudioSetup(in_data, out_data, params, output);
     case PF_Cmd_AUDIO_RENDER:     return AudioRender(in_data, out_data, params, output);
     default: return PF_Err_NONE;

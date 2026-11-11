@@ -16,8 +16,15 @@ struct Config {
     std::vector<std::string> whitelist;
 };
 
-// Search <plugin_dir>/MatCutter.json then D:/AEplugin/MatCutter.json.
+// Search <plugin_dir>/NwRemover.json then D:/AEplugin/NwRemover.json.
 Config load_config(const std::string& plugin_dir);
+
+// Append a Groq key to groq_api_keys in the config file (dedupe).
+// Uses the same search order as load_config; creates the file if missing.
+bool add_groq_key(const std::string& plugin_dir, const std::string& key);
+
+// Set models_dir in the config file (same search order as load_config).
+bool set_models_dir(const std::string& plugin_dir, const std::string& dir);
 
 // model_choice: 1 tiny, 2 base, 3 small, 4 medium, 5 large-v3, 6 from config.
 std::string resolve_model_path(const Config& cfg, int model_choice);

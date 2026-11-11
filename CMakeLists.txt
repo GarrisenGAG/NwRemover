@@ -27,6 +27,7 @@ add_library(NwRemover SHARED
 target_include_directories(NwRemover PRIVATE
   ${ROOT}/src
   ${SDK}/Headers
+  ${SDK}/Headers/SP
   ${SDK}/Util
   ${WHISPER}/include
   ${WHISPER}/ggml/include
@@ -45,6 +46,7 @@ target_link_libraries(NwRemover PRIVATE
   ${WBUILD}/ggml/src/ggml-base.a
   -Wl,--end-group
   winhttp
+  ole32
 )
 target_link_options(NwRemover PRIVATE -static -static-libgcc -static-libstdc++ -fopenmp)
 
