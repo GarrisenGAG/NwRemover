@@ -11,6 +11,9 @@
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <thread>
+#include <chrono>
+#include <functional>
 
 #include "AEConfig.h"
 #include "A.h"
@@ -42,6 +45,7 @@ enum {
     P_ENABLE,
     P_STATUS,
     P_INFO,
+    P_PROGRESS,
     P_TOPIC_ANALYSIS,
     P_BACKEND,
     P_MODEL,
@@ -133,6 +137,8 @@ static const char* kGroqModels[] = {"", "whisper-large-v3", "whisper-large-v3-tu
 static std::atomic<bool> g_analysis_cancel{false};
 static void update_param_name(PF_InData* in_data, PF_ParamDef* params[],
                               PF_ParamIndex idx, const char* name);
+static void update_slider_value(PF_InData* in_data, PF_ParamDef* params[],
+                                PF_ParamIndex idx, float v);
 
 // Platform preset -> max dictionary severity (1 severe, 2 medium, 3 mild).
 static int platform_severity(int platform_popup, int strictness_slider) {
@@ -211,47 +217,83 @@ static bool checkout_mono16k(PF_InData* in_data, A_long start, A_long dur,
     return !out.empty();
 }
 
-static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
-                                const std::vector<float>& mono16k, double dur, bool show_status) {
-    mc::Config cfg = mc::load_config(plugin_dir());
-    mc::Dictionary dict = mc::default_dictionary();
-    for (auto& w : cfg.custom_words) dict.add(w, {}, 1);
-    for (auto& w : cfg.whitelist) dict.global_whitelist.push_back(mc::normalize_word(w));
-    dict.max_severity = platform_severity((int)params[P_PLATFORM]->u.pd.value,
-                                          (int)params[P_STRICTNESS]->u.sd.value);
-    if (show_status) update_param_name(in_data, params, P_STATUS, "Status: analyzing...");
+// ---- analysis pipeline (shared by render path and interactive path) ----
+// Everything AE-related (param UI, sequence-data locks, PF_PROGRESS) stays on the
+// thread that owns in_data. The transcription itself is pure and can run on a worker.
+struct JobInputs {
+    int backend = 1;
+    std::string lang = "ru";
+    double pad = 0.08, merge = 0.15;
+    mc::Dictionary dict;
+    std::string model_path;   // local
+    int threads = 4;          // local
+    mc::GroqOptions go;       // groq
+};
 
-    int backend = (int)params[P_BACKEND]->u.pd.value;
+static JobInputs prepare_analysis(PF_InData* in_data, PF_ParamDef* params[]) {
+    JobInputs in;
+    mc::Config cfg = mc::load_config(plugin_dir());
+    in.dict = mc::default_dictionary();
+    for (auto& w : cfg.custom_words) in.dict.add(w, {}, 1);
+    for (auto& w : cfg.whitelist) in.dict.global_whitelist.push_back(mc::normalize_word(w));
+    in.dict.max_severity = platform_severity((int)params[P_PLATFORM]->u.pd.value,
+                                             (int)params[P_STRICTNESS]->u.sd.value);
+    in.backend = (int)params[P_BACKEND]->u.pd.value;
     int lang_idx = (int)params[P_LANGUAGE]->u.pd.value;
     if (lang_idx < 1 || lang_idx > 14) lang_idx = 1;
-    std::string lang = kLanguages[lang_idx - 1];
-    double pad = params[P_PAD_MS]->u.sd.value / 1000.0;
-    double merge = params[P_MERGE_MS]->u.sd.value / 1000.0;
-
-    mc::AnalysisResult r;
-    if (backend == 2) {
-        mc::GroqOptions go;
-        go.api_key = cfg.groq_api_key;
-        go.api_keys = cfg.groq_api_keys;
-        go.proxy = cfg.proxy;
+    in.lang = kLanguages[lang_idx - 1];
+    in.pad = params[P_PAD_MS]->u.sd.value / 1000.0;
+    in.merge = params[P_MERGE_MS]->u.sd.value / 1000.0;
+    if (in.backend == 2) {
+        in.go.api_key = cfg.groq_api_key;
+        in.go.api_keys = cfg.groq_api_keys;
+        in.go.proxy = cfg.proxy;
         int gm = (int)params[P_GROQ_MODEL]->u.pd.value;
-        go.model = (gm >= 1 && gm <= 2) ? kGroqModels[gm] : "whisper-large-v3";
-        go.language = lang;
-        r = mc::transcribe_groq(mono16k, go);
+        in.go.model = (gm >= 1 && gm <= 2) ? kGroqModels[gm] : "whisper-large-v3";
+        in.go.language = in.lang;
+    } else {
+        in.model_path = mc::resolve_model_path(cfg, (int)params[P_MODEL]->u.pd.value);
+        in.threads = (int)params[P_THREADS]->u.sd.value;
+    }
+    return in;
+}
+
+// Pure transcription + cut building. No AE calls. progress_fn/abort_fn are supplied
+// by the caller: the render path wires them to PF_PROGRESS/PF_ABORT (calling thread),
+// the interactive path wires them to atomics read/written from a worker thread.
+static mc::AnalysisResult run_transcription(const JobInputs& in, const std::vector<float>& mono,
+                                            std::function<void(int)> progress_fn,
+                                            std::function<bool()> abort_fn,
+                                            std::vector<mc::Cut>* cuts) {
+    mc::AnalysisResult r;
+    if (in.backend == 2) {
+        r = mc::transcribe_groq(mono, in.go);
     } else {
         mc::AnalysisOptions opt;
-        opt.model_path = mc::resolve_model_path(cfg, (int)params[P_MODEL]->u.pd.value);
-        opt.language = lang;
-        opt.threads = (int)params[P_THREADS]->u.sd.value;
-        g_analysis_cancel = false;
-        // progress_callback fires on the whisper_full calling thread (safe for AE),
-        // abort_callback fires inside ggml worker threads and only reads the atomic.
-        opt.progress = [in_data](int p){
-            if (PF_ABORT(in_data) != PF_Err_NONE) g_analysis_cancel = true;
-            PF_PROGRESS(in_data, p, 100);
-        };
-        opt.abort = []()->bool { return g_analysis_cancel.load(); };
-        r = mc::transcribe_local(mono16k.data(), mono16k.size(), opt);
+        opt.model_path = in.model_path;
+        opt.language = in.lang;
+        opt.threads = in.threads;
+        opt.progress = progress_fn;
+        opt.abort = abort_fn;
+        r = mc::transcribe_local(mono.data(), mono.size(), opt);
+    }
+    if (r.ok && cuts) *cuts = mc::build_cuts(r.words, in.dict, in.pad, in.merge);
+    return r;
+}
+
+// Store results + update the panel. Must run on the in_data-owning thread.
+static std::string finalize_analysis(PF_InData* in_data, PF_ParamDef* params[],
+                                     const JobInputs& in, const mc::AnalysisResult& r,
+                                     const std::vector<mc::Cut>& cuts, double dur,
+                                     bool show_status, bool cancelled) {
+    if (cancelled) {
+        log_line("ANALYSIS CANCELLED");
+        if (show_status) {
+            update_param_name(in_data, params, P_STATUS, "Status: cancelled");
+            update_param_name(in_data, params, P_INFO, "Info: analysis cancelled");
+            update_slider_value(in_data, params, P_PROGRESS, 0);
+        }
+        return "Cancelled";
     }
     if (!r.ok) {
         log_line("ANALYSIS ERROR: " + r.error);
@@ -263,9 +305,8 @@ static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
         }
         return r.error;
     }
-    auto cuts = mc::build_cuts(r.words, dict, pad, merge);
     store_cuts(in_data, cuts, 16000.0, dur);
-    log_line("ANALYSIS OK backend=" + std::to_string(backend) + " severity=" + std::to_string(dict.max_severity) +
+    log_line("ANALYSIS OK backend=" + std::to_string(in.backend) + " severity=" + std::to_string(in.dict.max_severity) +
              " words=" + std::to_string(r.words.size()) + " cuts=" + std::to_string(cuts.size()) + " dur=" + std::to_string(dur));
     for (auto& c : cuts)
         log_line("  cut " + std::to_string(c.start) + "-" + std::to_string(c.end) + " [" + c.word + "]");
@@ -274,10 +315,91 @@ static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
         char ibuf[128];
         std::snprintf(ibuf, sizeof(ibuf), "Info: %zu cuts from %zu words", cuts.size(), r.words.size());
         update_param_name(in_data, params, P_INFO, ibuf);
+        update_slider_value(in_data, params, P_PROGRESS, 100);
     }
     char buf[128];
     std::snprintf(buf, sizeof(buf), "OK: %zu words, %zu cuts", r.words.size(), cuts.size());
     return std::string(buf);
+}
+
+// Render path: synchronous on the render thread, progress reported through AE's own
+// render progress bar via PF_PROGRESS (safe from the whisper_full calling thread).
+static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
+                                const std::vector<float>& mono16k, double dur, bool show_status) {
+    JobInputs in = prepare_analysis(in_data, params);
+    if (show_status) update_param_name(in_data, params, P_STATUS, "Status: analyzing...");
+    g_analysis_cancel = false;
+    auto prog = [in_data](int p){
+        if (PF_ABORT(in_data) != PF_Err_NONE) g_analysis_cancel = true;
+        PF_PROGRESS(in_data, p, 100);
+    };
+    auto abrt = []()->bool { return g_analysis_cancel.load(); };
+    std::vector<mc::Cut> cuts;
+    mc::AnalysisResult r = run_transcription(in, mono16k, prog, abrt, &cuts);
+    bool cancelled = g_analysis_cancel.load() && !r.ok;
+    return finalize_analysis(in_data, params, in, r, cuts, dur, show_status, cancelled);
+}
+
+// ---- native AE progress dialog (PFAppSuite6) ----
+static PFAppSuite6* acquire_app_suite(PF_InData* in_data) {
+    if (!in_data->pica_basicP) return nullptr;
+    PFAppSuite6* s = nullptr;
+    if ((*in_data->pica_basicP->AcquireSuite)(kPFAppSuite, kPFAppSuiteVersion6, (const void**)&s) != 0 || !s)
+        return nullptr;
+    return s;
+}
+static void release_app_suite(PF_InData* in_data, PFAppSuite6* s) {
+    if (in_data->pica_basicP && s)
+        (*in_data->pica_basicP->ReleaseSuite)(kPFAppSuite, kPFAppSuiteVersion6);
+}
+
+// Interactive path (Analyze button): transcription runs on a worker thread while the
+// UI thread pumps AE's native modal progress dialog. The dialog is the "normal" AE
+// progress bar with a Cancel button; PF_AppProgressDialogUpdate keeps the UI alive and
+// returns PF_Interrupt_CANCEL when the user cancels. whisper reads determinate percent;
+// Groq is a single blocking upload so it gets the indeterminate barber-pole style.
+static void run_analysis_interactive(PF_InData* in_data, PF_ParamDef* params[],
+                                     const std::vector<float>& mono, double dur) {
+    JobInputs in = prepare_analysis(in_data, params);
+    update_param_name(in_data, params, P_STATUS, "Status: analyzing...");
+    update_slider_value(in_data, params, P_PROGRESS, 0);
+
+    std::atomic<int> progress{0};
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> done{false};
+    mc::AnalysisResult result;
+    std::vector<mc::Cut> cuts;
+
+    std::thread worker([&]{
+        auto prog = [&progress](int p){ progress.store(p); };
+        auto abrt = [&cancel]()->bool { return cancel.load(); };
+        result = run_transcription(in, mono, prog, abrt, &cuts);
+        done.store(true);
+    });
+
+    PFAppSuite6* app = acquire_app_suite(in_data);
+    PF_AppProgressDialogP dlg = nullptr;
+    bool determinate = (in.backend != 2);
+    if (app && app->PF_CreateNewAppProgressDialog)
+        app->PF_CreateNewAppProgressDialog(reinterpret_cast<const A_UTF16Char*>(L"NwRemover - analyzing audio"),
+                                           nullptr, determinate ? FALSE : TRUE, &dlg);
+
+    // Pump on the UI thread (~80ms cadence per SDK guidance). No AE calls from worker.
+    while (!done.load()) {
+        int p = progress.load();
+        if (dlg && app && app->PF_AppProgressDialogUpdate) {
+            PF_Err e = app->PF_AppProgressDialogUpdate(dlg, determinate ? p : 0, determinate ? 100 : 0);
+            if (e == PF_Interrupt_CANCEL) cancel.store(true);
+        }
+        update_slider_value(in_data, params, P_PROGRESS, (float)p);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+    worker.join();
+    if (dlg && app && app->PF_DisposeAppProgressDialog) app->PF_DisposeAppProgressDialog(dlg);
+    release_app_suite(in_data, app);
+
+    bool cancelled = cancel.load() && !result.ok;
+    finalize_analysis(in_data, params, in, result, cuts, dur, true, cancelled);
 }
 
 static std::wstring report_text(PF_InData* in_data) {
@@ -577,6 +699,20 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
         def.uu.id = P_INFO;
         PF_ADD_PARAM(in_data, -1, &def);
     }
+    // In-panel progress bar: a disabled float slider whose value we drive from a
+    // UI-thread timer while the async analysis runs (no separate progress window).
+    {
+        AEFX_CLR_STRUCT(def);
+        def.param_type = PF_Param_FLOAT_SLIDER;
+        PF_STRNNCPY(def.name, "Progress", sizeof(def.name));
+        def.u.fs_d.valid_min = 0; def.u.fs_d.valid_max = 100;
+        def.u.fs_d.slider_min = 0; def.u.fs_d.slider_max = 100;
+        def.u.fs_d.value = def.u.fs_d.dephault = 0;
+        def.u.fs_d.precision = 0;
+        def.ui_flags = PF_PUI_DISABLED;
+        def.uu.id = P_PROGRESS;
+        PF_ADD_PARAM(in_data, -1, &def);
+    }
 
     PF_ADD_TOPIC("Analysis", P_TOPIC_ANALYSIS);
     // Backend popup written manually: needs PF_ParamFlag_SUPERVISE so that
@@ -654,6 +790,17 @@ static PF_Err SequenceResetup(PF_InData* in_data, PF_OutData*, PF_ParamDef*[], P
     return PF_Err_NONE;
 }
 
+// Update a float-slider param value from within a valid AE callback (no separate window).
+static void update_slider_value(PF_InData* in_data, PF_ParamDef* params[], PF_ParamIndex idx, float v) {
+    if (!params || !params[idx]) return;
+    PF_ParamUtilsSuite3* s = acquire_param_suite(in_data);
+    if (!s || !s->PF_UpdateParamUI) { release_param_suite(in_data, s); return; }
+    PF_ParamDef d = *params[idx]; d.u.fs_d.value = (PF_FpShort)v;
+    (*s->PF_UpdateParamUI)(in_data->effect_ref, idx, &d);
+    release_param_suite(in_data, s);
+}
+
+
 static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
                                PF_ParamDef* params[], PF_LayerDef*, void* extra) {
     auto* e = (PF_UserChangedParamExtra*)extra;
@@ -706,19 +853,11 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
         std::vector<float> mono;
         bool got = checkout_mono16k(in_data, 0, in_data->total_time, in_data->time_scale, mono);
         if (got) {
-            double dur = mono.size() / 16000.0;
-            std::string res = run_analysis(in_data, params, mono, dur, true);
-            std::wstring msg = to_wide(res);
-            if (res.rfind("OK:", 0) == 0)
-                MessageBoxW(nullptr, (L"Analysis complete.\n" + msg).c_str(), L"NwRemover", MB_OK | MB_ICONINFORMATION);
-            else
-                MessageBoxW(nullptr, (L"Analysis failed:\n" + msg).c_str(), L"NwRemover", MB_OK | MB_ICONWARNING);
+            run_analysis_interactive(in_data, params, mono, mono.size() / 16000.0);
         } else {
             SeqData* s = seq_lock(in_data);
             if (s) { s->pending = 1; seq_unlock(in_data); }
-            MessageBoxW(nullptr,
-                L"Could not read layer audio directly.\nAnalysis is armed - it will run on the next audio preview/render (press Space).",
-                L"NwRemover", MB_OK | MB_ICONINFORMATION);
+            update_param_name(in_data, params, P_STATUS, "Status: armed, press Space");
         }
         return PF_Err_NONE;
     }
