@@ -26,6 +26,9 @@ bool add_groq_key(const std::string& plugin_dir, const std::string& key);
 // Set models_dir in the config file (same search order as load_config).
 bool set_models_dir(const std::string& plugin_dir, const std::string& dir);
 
+// Set replacement_sound (WAV path) in the config file (same search order).
+bool set_replacement_sound(const std::string& plugin_dir, const std::string& path);
+
 // model_choice: 1 tiny, 2 base, 3 small, 4 medium, 5 large-v3, 6 from config.
 std::string resolve_model_path(const Config& cfg, int model_choice);
 

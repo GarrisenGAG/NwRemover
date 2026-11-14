@@ -2,6 +2,9 @@
 // whisper.cpp or Groq API. Platform presets, custom replacement sound, manual mute.
 #include <windows.h>
 #include <shlobj.h>
+#include <shellapi.h>
+#include <commdlg.h>
+#include <winhttp.h>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -23,6 +26,7 @@
 #include "AE_EffectUI.h"
 #include "AE_EffectSuites.h"
 #include "AE_EffectVers.h"
+#include "AE_GeneralPlug.h"
 #include "AE_Macros.h"
 #include "Param_Utils.h"
 #include "SP/SPBasic.h"
@@ -50,6 +54,7 @@ enum {
     P_BACKEND,
     P_MODEL,
     P_MODELDIR,
+    P_DOWNLOAD,
     P_GROQ_MODEL,
     P_APIKEY,
     P_LANGUAGE,
@@ -73,12 +78,18 @@ enum {
     P_BEEP_SWEEP,
     P_PITCH_SEMI,
     P_FADE_MS,
+    P_REPL_SOUND,
     P_END_REPLACE,
     P_TOPIC_MANUAL,
     P_MANUAL_ENABLE,
     P_MANUAL_TIME,
     P_MANUAL_LEN,
     P_END_MANUAL,
+    P_TOPIC_TIMELINE,
+    P_TL_LAYOUT,
+    P_TL_ORIG,
+    P_TL_VOL,
+    P_END_TIMELINE,
     P_NUM_PARAMS
 };
 
@@ -132,6 +143,79 @@ static std::wstring to_wide(const std::string& s) {
 
 static const char* kLanguages[] = {"auto","ru","en","uk","be","de","fr","es","it","pl","tr","ja","ko","zh"};
 static const char* kGroqModels[] = {"", "whisper-large-v3", "whisper-large-v3-turbo"};
+static const char* kModelNames[] = {"tiny","base","small","medium","large-v3"};
+
+// Stream a HTTPS file to disk with progress (percent) and cancel. Returns "" on success.
+static std::string download_model_file(const std::string& url, const std::string& dest,
+                                       const std::function<void(int)>& prog,
+                                       const std::function<bool()>& cancel) {
+    std::string host, path;
+    {
+        size_t p = url.find("://");
+        std::string rest = (p == std::string::npos) ? url : url.substr(p + 3);
+        size_t s = rest.find('/');
+        host = rest.substr(0, s);
+        path = (s == std::string::npos) ? "/" : rest.substr(s);
+    }
+    mc::Config cfg = mc::load_config(plugin_dir());
+    std::wstring proxy;
+    if (!cfg.proxy.empty()) {
+        std::string pr = cfg.proxy;
+        size_t p = pr.find("://"); if (p != std::string::npos) pr = pr.substr(p + 3);
+        while (!pr.empty() && pr.back() == '/') pr.pop_back();
+        proxy = to_wide(pr);
+    }
+    DWORD access = proxy.empty() ? WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY : WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+    HINTERNET hS = WinHttpOpen(L"NwRemover/1.0", access,
+                               proxy.empty() ? WINHTTP_NO_PROXY_NAME : proxy.c_str(),
+                               WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hS) return "WinHttpOpen failed";
+    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hS, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
+    WinHttpSetTimeouts(hS, 15000, 30000, 60000, 120000);
+    std::string err;
+    HINTERNET hC = WinHttpConnect(hS, to_wide(host).c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET hR = hC ? WinHttpOpenRequest(hC, L"GET", to_wide(path).c_str(), nullptr,
+                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                           WINHTTP_FLAG_SECURE) : nullptr;
+    if (hR && WinHttpSendRequest(hR, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+           && WinHttpReceiveResponse(hR, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(hR, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        if (status != 200) {
+            err = "HTTP " + std::to_string(status);
+        } else {
+            DWORD total = 0; sz = sizeof(total);
+            WinHttpQueryHeaders(hR, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &total, &sz, WINHTTP_NO_HEADER_INDEX);
+            std::ofstream f(dest, std::ios::binary | std::ios::trunc);
+            if (!f) { err = "cannot write " + dest; }
+            else {
+                std::vector<char> buf(65536);
+                uint64_t got = 0;
+                for (;;) {
+                    if (cancel()) { err = "cancelled"; break; }
+                    DWORD rd = 0;
+                    if (!WinHttpReadData(hR, buf.data(), (DWORD)buf.size(), &rd) || rd == 0) break;
+                    f.write(buf.data(), rd);
+                    got += rd;
+                    if (total > 0) prog((int)(got * 100 / total));
+                }
+                f.close();
+                if (err.empty() && total > 0 && got != total) err = "incomplete download";
+                if (err.empty()) prog(100);
+            }
+        }
+    } else {
+        err = "request failed err=" + std::to_string(GetLastError());
+    }
+    if (hR) WinHttpCloseHandle(hR);
+    if (hC) WinHttpCloseHandle(hC);
+    WinHttpCloseHandle(hS);
+    if (!err.empty()) DeleteFileA(dest.c_str());
+    return err;
+}
 
 // cancel flag for whisper (read from ggml worker threads, set from the calling thread)
 static std::atomic<bool> g_analysis_cancel{false};
@@ -340,24 +424,264 @@ static std::string run_analysis(PF_InData* in_data, PF_ParamDef* params[],
     return finalize_analysis(in_data, params, in, r, cuts, dur, show_status, cancelled);
 }
 
-// ---- native AE progress dialog (PFAppSuite6) ----
-static PFAppSuite6* acquire_app_suite(PF_InData* in_data) {
-    if (!in_data->pica_basicP) return nullptr;
-    PFAppSuite6* s = nullptr;
-    if ((*in_data->pica_basicP->AcquireSuite)(kPFAppSuite, kPFAppSuiteVersion6, (const void**)&s) != 0 || !s)
-        return nullptr;
-    return s;
+// ---- timeline surgery: cut the track into pieces + insert replacement clips ----
+// Render one replacement interval into dst (n mono frames at rate).
+// mode 6 = repeat the clean audio immediately preceding the cut.
+static bool render_piece(int mode, const mc::DspParams& p, double a, double b,
+                         const std::vector<float>& mono16k, const mc::Config& cfg,
+                         float* dst, int64_t n, int rate) {
+    if (n <= 0) return false;
+    if (mode == mc::MODE_MUTE) return false; // silence = leave a gap, insert nothing
+    if (mode == mc::MODE_CUSTOM) {
+        mc::WavData w = mc::read_wav(cfg.replacement_sound);
+        if (!w.ok) return false;
+        auto mono = mc::mixdown_mono(w);
+        auto rs = mc::resample_linear(mono, w.rate, rate);
+        if (rs.empty()) return false;
+        mc::process_custom(rs.data(), (int64_t)rs.size(), dst, n, 1, rate, p.beep_level, p.fade_ms);
+        return true;
+    }
+    if (mode == mc::MODE_REVERSE || mode == mc::MODE_PITCH) {
+        int64_t ia = (int64_t)(a * 16000), ib = (int64_t)(b * 16000);
+        if (ia < 0) ia = 0;
+        if (ib > (int64_t)mono16k.size()) ib = (int64_t)mono16k.size();
+        if (ib <= ia) return false;
+        std::vector<float> src16(mono16k.begin() + ia, mono16k.begin() + ib);
+        auto src = mc::resample_linear(src16, 16000, rate);
+        src.resize((size_t)n, 0.0f);
+        mc::process_interval(src.data(), dst, n, 1, rate, p);
+        return true;
+    }
+    if (mode == 6) { // repeat preceding clean audio, looped to fill the cut
+        int64_t ib = (int64_t)(a * 16000);
+        int64_t ia = (int64_t)(std::max(0.0, a - 0.6) * 16000);
+        if (ib > (int64_t)mono16k.size()) ib = (int64_t)mono16k.size();
+        if (ib > ia) {
+            std::vector<float> src16(mono16k.begin() + ia, mono16k.begin() + ib);
+            auto src = mc::resample_linear(src16, 16000, rate);
+            if (!src.empty()) {
+                for (int64_t i = 0; i < n; i++)
+                    dst[i] = src[(size_t)(i % (int64_t)src.size())] * p.beep_level;
+                return true;
+            }
+        }
+        mc::process_interval(nullptr, dst, n, 1, rate, p); // fallback beep
+        return true;
+    }
+    mc::process_interval(nullptr, dst, n, 1, rate, p); // beep
+    return true;
 }
-static void release_app_suite(PF_InData* in_data, PFAppSuite6* s) {
-    if (in_data->pica_basicP && s)
-        (*in_data->pica_basicP->ReleaseSuite)(kPFAppSuite, kPFAppSuiteVersion6);
+
+static bool generate_replacement_wav(const std::string& path, int mode, const mc::DspParams& p,
+                                     double a, double b, const std::vector<float>& mono16k,
+                                     const mc::Config& cfg) {
+    const int rate = 48000;
+    int64_t n = (int64_t)((b - a) * rate);
+    if (n <= 0) return false;
+    std::vector<float> dst((size_t)n, 0.0f);
+    if (!render_piece(mode, p, a, b, mono16k, cfg, dst.data(), n, rate)) return false;
+    return mc::write_wav16(path, dst, rate, 1);
+}
+
+// One full-length WAV: silence everywhere except replacement audio at each cut,
+// so a single top layer can carry all replacement pieces.
+static bool generate_combined_wav(const std::string& path, int mode, const mc::DspParams& p,
+                                  const std::vector<mc::Cut>& cuts, const std::vector<float>& mono16k,
+                                  const mc::Config& cfg, double dur) {
+    const int rate = 48000;
+    int64_t N = (int64_t)(dur * rate);
+    if (N <= 0) return false;
+    std::vector<float> buf((size_t)N, 0.0f);
+    for (auto& c : cuts) {
+        int64_t off = (int64_t)(c.start * rate);
+        int64_t n = (int64_t)((c.end - c.start) * rate);
+        if (off < 0 || off >= N || n <= 0) continue;
+        if (off + n > N) n = N - off;
+        render_piece(mode, p, c.start, c.end, mono16k, cfg, buf.data() + off, n, rate);
+    }
+    return mc::write_wav16(path, buf, rate, 1);
+}
+
+// Run an ExtendScript in-process via AEGP (register a plugin id, then ExecuteScript).
+// This edits the live timeline on the UI thread without spawning a second AE instance.
+static bool run_script_with_pica(SPBasicSuite* pica, const std::string& js) {
+    if (!pica) return false;
+    AEGP_UtilitySuite6* u = nullptr;
+    if ((*pica->AcquireSuite)(kAEGPUtilitySuite, kAEGPUtilitySuiteVersion6, (const void**)&u) != 0 || !u)
+        return false;
+    AEGP_PluginID id = 0;
+    A_Err e = u->AEGP_RegisterWithAEGP(nullptr, "NwRemover", &id);
+    if (e == A_Err_NONE)
+        e = u->AEGP_ExecuteScript(id, js.c_str(), FALSE, nullptr, nullptr);
+    (*pica->ReleaseSuite)(kAEGPUtilitySuite, kAEGPUtilitySuiteVersion6);
+    return e == A_Err_NONE;
+}
+
+// Executing a script inside PF_Cmd_USER_CHANGED_PARAM crashes AE, so defer it to a
+// hidden message window: the WM_APP handler runs on the UI thread once the effect
+// callback has returned and AE is idle.
+static SPBasicSuite* g_def_pica = nullptr;
+static std::string g_def_js;
+static HWND g_def_wnd = nullptr;
+static LRESULT CALLBACK def_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_APP + 1) {
+        bool ok = run_script_with_pica(g_def_pica, g_def_js);
+        log_line(std::string("TIMELINE CUT: deferred exec ") + (ok ? "ok" : "FAILED"));
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void defer_script(PF_InData* in_data, const std::string& js) {
+    g_def_pica = in_data->pica_basicP;
+    g_def_js = js;
+    if (!g_def_wnd) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = def_wndproc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"NwRemoverDefer";
+        RegisterClassW(&wc);
+        g_def_wnd = CreateWindowExW(0, L"NwRemoverDefer", L"", 0, 0, 0, 0, 0,
+                                    HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    }
+    if (g_def_wnd) PostMessageW(g_def_wnd, WM_APP + 1, 0, 0);
+    else log_line("TIMELINE CUT: defer window failed");
+}
+
+// Build replacement WAVs + an ExtendScript that splits the audio layer into clean
+// pieces and inserts the replacements as separate clips, then run it in-process.
+static void apply_cuts_to_timeline(PF_InData* in_data, PF_ParamDef* params[],
+                                   const std::vector<mc::Cut>& cuts, const std::vector<float>& mono16k,
+                                   double dur) {
+    if (cuts.empty()) return;
+    // plugin_dir() is usually under Program Files (not user-writable); use a temp dir.
+    char tmp[MAX_PATH] = {0};
+    GetTempPathA(MAX_PATH, tmp);
+    std::string dir = std::string(tmp) + "NwRemover_cuts";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    std::string fdir = dir;
+    for (auto& c : fdir) if (c == '\\') c = '/';
+    mc::Config cfg = mc::load_config(plugin_dir());
+    mc::DspParams p;
+    p.mode = (int)params[P_MODE]->u.pd.value;
+    p.beep_freq = params[P_BEEP_FREQ]->u.fs_d.value;
+    p.beep_level = params[P_BEEP_LEVEL]->u.fs_d.value;
+    p.beep_wave = (int)params[P_BEEP_WAVE]->u.pd.value - 1;
+    p.beep_sweep = params[P_BEEP_SWEEP]->u.fs_d.value;
+    p.pitch_semi = params[P_PITCH_SEMI]->u.fs_d.value;
+    p.fade_ms = params[P_FADE_MS]->u.fs_d.value;
+    int layout = (int)params[P_TL_LAYOUT]->u.pd.value;
+    int orig = (int)params[P_TL_ORIG]->u.pd.value;
+    float vol = params[P_TL_VOL]->u.fs_d.value;
+
+    std::string combined;
+    if (layout == 1) {
+        std::string cw = dir + "/combined.wav";
+        if (generate_combined_wav(cw, p.mode, p, cuts, mono16k, cfg, dur)) {
+            combined = cw;
+            for (auto& c : combined) if (c == '\\') c = '/';
+        }
+    }
+    std::string entries;
+    int inserted = 0;
+    for (size_t i = 0; i < cuts.size(); i++) {
+        std::string jsxwav;
+        if (layout != 1) {
+            char name[64]; std::snprintf(name, sizeof(name), "/cut_%03zu.wav", i);
+            std::string wav = dir + name;
+            if (generate_replacement_wav(wav, p.mode, p, cuts[i].start, cuts[i].end, mono16k, cfg)) {
+                jsxwav = wav;
+                for (auto& c : jsxwav) if (c == '\\') c = '/';
+                inserted++;
+            }
+        }
+        char line[512];
+        std::snprintf(line, sizeof(line), "[%f,%f,\"%s\"],", cuts[i].start, cuts[i].end, jsxwav.c_str());
+        entries += line;
+    }
+    if (layout == 1 && !combined.empty()) inserted = (int)cuts.size();
+
+    std::string js = R"JS(
+function log(m){var f=new File("__LOG__");f.open("a");f.writeln(m);f.close();}
+try{
+    var cuts=[__CUTS__];
+    var layout=__LAYOUT__, orig=__ORIG__, vol=__VOL__, combined="__COMBINED__";
+    var target=null, comp=null;
+    for(var ci=1;ci<=app.project.items.length;ci++){
+        var it=app.project.items[ci];
+        if(!(it instanceof CompItem))continue;
+        for(var li=1;li<=it.layers.length;li++){
+            var ly=it.layers[li];
+            var ep=ly.property("ADBE Effect Parade");
+            if(ep){for(var ei=1;ei<=ep.numProperties;ei++){
+                if(ep.property(ei).matchName==="GH NwRemover"){target=ly;comp=it;break;}
+            }}
+            if(target)break;
+        }
+        if(target)break;
+    }
+    if(!target){log("FATAL no NwRemover layer");throw new Error("no layer");}
+    var t0=target.startTime, dur=target.startTime+(target.outPoint-target.inPoint);
+    var clean=[]; var cur=t0;
+    for(var i=0;i<cuts.length;i++){
+        if(cuts[i][0]>cur+0.001) clean.push([cur,cuts[i][0]]);
+        cur=Math.max(cur,cuts[i][1]);
+    }
+    if(cur<dur-0.001) clean.push([cur,dur]);
+    var db=20*Math.log(Math.max(vol,0.0001))/Math.LN10;
+    var nsrc=0,nbad=0;
+    function piece(s,e,bad){
+        var dup=target.duplicate();
+        dup.inPoint=s; dup.outPoint=e; dup.startTime=s;
+        if(bad){
+            nbad++; dup.name="NwBad_"+nbad;
+            if(orig==2){ dup.audioEnabled=false; }
+            else if(orig==3){ dup.property("ADBE Audio Group").property("ADBE Audio Levels").setValue([db,db]); }
+        } else { nsrc++; dup.name="NwSrc_"+nsrc; }
+    }
+    for(var c=0;c<clean.length;c++) piece(clean[c][0],clean[c][1],false);
+    if(orig!=1){ for(var i=0;i<cuts.length;i++) piece(cuts[i][0],cuts[i][1],true); }
+    target.remove();
+    if(layout==1 && combined){
+        var foot0=app.project.importFile(new ImportOptions(new File(combined)));
+        var nl0=comp.layers.add(foot0);
+        nl0.startTime=0; nl0.inPoint=0; nl0.outPoint=dur; nl0.name="NwReplace";
+    } else {
+        for(var i=0;i<cuts.length;i++){
+            var a=cuts[i][0], b2=cuts[i][1], wav=cuts[i][2];
+            if(!wav) continue;
+            var foot=app.project.importFile(new ImportOptions(new File(wav)));
+            var nl=comp.layers.add(foot);
+            nl.startTime=a; nl.inPoint=0; nl.outPoint=(b2-a);
+            nl.name="NwCut_"+(i+1);
+        }
+    }
+    log("DONE layers="+comp.layers.length+" src="+nsrc+" bad="+nbad+" layout="+layout+" orig="+orig);
+}catch(e){log("FATAL "+e.toString()+" line "+e.line);}
+)JS";
+    std::string marker = "__CUTS__";
+    js.replace(js.find(marker), marker.size(), entries);
+    std::string logmark = "__LOG__";
+    js.replace(js.find(logmark), logmark.size(), fdir + "/apply_log.txt");
+    js.replace(js.find("__LAYOUT__"), 10, std::to_string(layout));
+    js.replace(js.find("__ORIG__"), 8, std::to_string(orig));
+    js.replace(js.find("__VOL__"), 7, std::to_string(vol));
+    js.replace(js.find("__COMBINED__"), 12, combined);
+    std::string jsx_path = dir + "/apply.jsx";
+    { std::ofstream f(jsx_path, std::ios::binary); f << js; }
+    log_line("TIMELINE CUT: cuts=" + std::to_string(cuts.size()) + " inserted=" + std::to_string(inserted) + " jsx=" + jsx_path);
+
+    // Hand the script to the running AE (host exe). Detached; do not wait.
+    defer_script(in_data, js);
 }
 
 // Interactive path (Analyze button): transcription runs on a worker thread while the
 // UI thread pumps AE's native modal progress dialog. The dialog is the "normal" AE
 // progress bar with a Cancel button; PF_AppProgressDialogUpdate keeps the UI alive and
-// returns PF_Interrupt_CANCEL when the user cancels. whisper reads determinate percent;
-// Groq is a single blocking upload so it gets the indeterminate barber-pole style.
+// returns PF_Interrupt_CANCEL when the user cancels. The bar is indeterminate (animated):
+// whisper only reports progress per ~30s chunk (0 then 100 for short clips) and Groq is a
+// single blocking upload, so a determinate percent would sit frozen; the animated bar
+// always moves and honestly reads as "working". The in-panel slider still mirrors the
+// coarse whisper percent as a secondary indicator.
 static void run_analysis_interactive(PF_InData* in_data, PF_ParamDef* params[],
                                      const std::vector<float>& mono, double dur) {
     JobInputs in = prepare_analysis(in_data, params);
@@ -377,29 +701,28 @@ static void run_analysis_interactive(PF_InData* in_data, PF_ParamDef* params[],
         done.store(true);
     });
 
-    PFAppSuite6* app = acquire_app_suite(in_data);
-    PF_AppProgressDialogP dlg = nullptr;
-    bool determinate = (in.backend != 2);
-    if (app && app->PF_CreateNewAppProgressDialog)
-        app->PF_CreateNewAppProgressDialog(reinterpret_cast<const A_UTF16Char*>(L"NwRemover - analyzing audio"),
-                                           nullptr, determinate ? FALSE : TRUE, &dlg);
-
-    // Pump on the UI thread (~80ms cadence per SDK guidance). No AE calls from worker.
+    // Pump on the UI thread: drive the in-panel Progress slider + Status label.
+    // No modal dialog here (a modal progress dialog flashed/dinged on this host).
+    // whisper percent is coarse for short clips, so blend a time-based estimate that
+    // keeps the bar moving; finalize sets it to 100 on success.
+    auto t_start = std::chrono::steady_clock::now();
     while (!done.load()) {
-        int p = progress.load();
-        if (dlg && app && app->PF_AppProgressDialogUpdate) {
-            PF_Err e = app->PF_AppProgressDialogUpdate(dlg, determinate ? p : 0, determinate ? 100 : 0);
-            if (e == PF_Interrupt_CANCEL) cancel.store(true);
-        }
-        update_slider_value(in_data, params, P_PROGRESS, (float)p);
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+        int wp = progress.load();
+        double est = 90.0 * (1.0 - std::exp(-el / std::max(2.0, dur * 0.4)));
+        int disp = (int)std::max<double>((double)wp, est);
+        if (disp > 90) disp = 90;
+        update_slider_value(in_data, params, P_PROGRESS, (float)disp);
+        char sb[64];
+        std::snprintf(sb, sizeof(sb), "Status: analyzing... %ds", (int)el);
+        update_param_name(in_data, params, P_STATUS, sb);
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
     }
     worker.join();
-    if (dlg && app && app->PF_DisposeAppProgressDialog) app->PF_DisposeAppProgressDialog(dlg);
-    release_app_suite(in_data, app);
 
     bool cancelled = cancel.load() && !result.ok;
     finalize_analysis(in_data, params, in, result, cuts, dur, true, cancelled);
+    if (result.ok && !cancelled) apply_cuts_to_timeline(in_data, params, cuts, mono, dur);
 }
 
 static std::wstring report_text(PF_InData* in_data) {
@@ -581,6 +904,22 @@ static bool folder_pick_dialog(std::wstring& out) {
     return ok;
 }
 
+// Open-file picker for the custom replacement WAV.
+static bool wav_pick_dialog(std::wstring& out) {
+    wchar_t file[MAX_PATH] = {0};
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = nullptr;
+    ofn.lpstrFilter = L"WAV audio\0*.wav\0All files\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrTitle = L"NwRemover: replacement sound (WAV)";
+    if (!GetOpenFileNameW(&ofn)) return false;
+    out = file;
+    return true;
+}
+
 struct ReportCtx { std::wstring text; };
 
 static LRESULT CALLBACK report_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -731,6 +1070,7 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     }
     PF_ADD_POPUP("Model (local)", 6, 2, "tiny|base|small|medium|large-v3|from config", P_MODEL);
     PF_ADD_BUTTON("", "Models folder...", 0, PF_ParamFlag_SUPERVISE, P_MODELDIR);
+    PF_ADD_BUTTON("", "Download model", 0, PF_ParamFlag_SUPERVISE, P_DOWNLOAD);
     PF_ADD_POPUP("Model (Groq)", 2, 1, "whisper-large-v3|whisper-large-v3-turbo", P_GROQ_MODEL);
     PF_ADD_BUTTON("", "API key...", 0, PF_ParamFlag_SUPERVISE, P_APIKEY);
     PF_ADD_POPUP("Language", 14, 2, "auto|ru|en|uk|be|de|fr|es|it|pl|tr|ja|ko|zh", P_LANGUAGE);
@@ -749,13 +1089,14 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_END_TOPIC(P_END_DETECT);
 
     PF_ADD_TOPIC("Replacement", P_TOPIC_REPLACE);
-    PF_ADD_POPUP("Replace with", 5, 1, "Beep|Silence|Reverse|Pitch shift|Custom sound", P_MODE);
+    PF_ADD_POPUP("Replace with", 6, 1, "Beep|Silence|Reverse|Pitch shift|Custom sound|Repeat (prev audio)", P_MODE);
     PF_ADD_FLOAT_SLIDER("Beep freq (Hz)", 100, 4000, 100, 4000, 0, 1000, 1, 0, FALSE, P_BEEP_FREQ);
     PF_ADD_FLOAT_SLIDER("Replacement level", 0, 1, 0, 1, 0, 0.25f, 2, 0, FALSE, P_BEEP_LEVEL);
     PF_ADD_POPUP("Beep wave", 3, 1, "sine|square|saw", P_BEEP_WAVE);
     PF_ADD_FLOAT_SLIDER("Beep sweep (st)", -24, 24, -24, 24, 0, 0, 1, 0, FALSE, P_BEEP_SWEEP);
     PF_ADD_FLOAT_SLIDER("Pitch (st)", -12, 12, -12, 12, 0, -5, 1, 0, FALSE, P_PITCH_SEMI);
     PF_ADD_FLOAT_SLIDER("Edge fade (ms)", 0, 50, 0, 50, 0, 5, 1, 0, FALSE, P_FADE_MS);
+    PF_ADD_BUTTON("", "Replacement sound...", 0, PF_ParamFlag_SUPERVISE, P_REPL_SOUND);
     PF_END_TOPIC(P_END_REPLACE);
 
     PF_ADD_TOPIC("Manual mute", P_TOPIC_MANUAL);
@@ -763,6 +1104,12 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_ADD_FLOAT_SLIDER("Mute at (sec)", 0, 3600, 0, 3600, 0, 0, 2, 0, FALSE, P_MANUAL_TIME);
     PF_ADD_SLIDER("Mute length (ms)", 0, 5000, 0, 5000, 500, P_MANUAL_LEN);
     PF_END_TOPIC(P_END_MANUAL);
+
+    PF_ADD_TOPIC("Timeline", P_TOPIC_TIMELINE);
+    PF_ADD_POPUP("Replacement layout", 2, 1, "One track (pieces)|Separate layers", P_TL_LAYOUT);
+    PF_ADD_POPUP("Original track", 3, 1, "Cut out pieces|Slice + mute|Slice + lower volume", P_TL_ORIG);
+    PF_ADD_FLOAT_SLIDER("Reduced level", 0, 1, 0, 1, 0, 0.25f, 2, 0, FALSE, P_TL_VOL);
+    PF_END_TOPIC(P_END_TIMELINE);
 
     out_data->num_params = P_NUM_PARAMS;
     return PF_Err_NONE;
@@ -846,6 +1193,58 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
             return PF_Err_NONE;
         }
         std::string info = "Info: models " + dir;
+        update_param_name(in_data, params, P_INFO, info.c_str());
+        return PF_Err_NONE;
+    }
+    if (e->param_index == P_DOWNLOAD) {
+        int mi = (int)params[P_MODEL]->u.pd.value;
+        std::string name = (mi >= 1 && mi <= 5) ? kModelNames[mi - 1] : "base";
+        mc::Config cfg = mc::load_config(plugin_dir());
+        CreateDirectoryA(cfg.models_dir.c_str(), nullptr);
+        std::string dest = cfg.models_dir + "/ggml-" + name + ".bin";
+        std::string url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-" + name + ".bin";
+        update_param_name(in_data, params, P_STATUS, "Status: downloading...");
+        update_slider_value(in_data, params, P_PROGRESS, 0);
+        std::atomic<int> pct{0};
+        std::atomic<bool> done{false}, cancel{false};
+        std::string derr;
+        std::thread th([&]{
+            derr = download_model_file(url, dest, [&](int p){ pct.store(p); },
+                                       [&]()->bool { return cancel.load(); });
+            done.store(true);
+        });
+        while (!done.load()) {
+            char sb[64];
+            std::snprintf(sb, sizeof(sb), "Status: downloading %d%%", pct.load());
+            update_param_name(in_data, params, P_STATUS, sb);
+            update_slider_value(in_data, params, P_PROGRESS, (float)pct.load());
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+        th.join();
+        if (derr.empty()) {
+            update_param_name(in_data, params, P_STATUS, "Status: model ready");
+            std::string info = "Info: model " + name + " downloaded";
+            update_param_name(in_data, params, P_INFO, info.c_str());
+            update_slider_value(in_data, params, P_PROGRESS, 100);
+        } else {
+            log_line("DOWNLOAD ERROR: " + derr);
+            update_param_name(in_data, params, P_STATUS, "Status: download error");
+            std::string info = "Info: " + derr;
+            if (info.size() > 90) info.resize(90);
+            update_param_name(in_data, params, P_INFO, info.c_str());
+        }
+        return PF_Err_NONE;
+    }
+    if (e->param_index == P_REPL_SOUND) {
+        std::wstring wpath;
+        if (!wav_pick_dialog(wpath)) return PF_Err_NONE;
+        std::string path = to_utf8(wpath);
+        if (!mc::set_replacement_sound(plugin_dir(), path)) {
+            MessageBoxW(nullptr, L"Не удалось записать NwRemover.json", L"NwRemover", MB_OK | MB_ICONERROR);
+            return PF_Err_NONE;
+        }
+        std::string info = "Info: sound " + path;
+        if (info.size() > 90) info.resize(90);
         update_param_name(in_data, params, P_INFO, info.c_str());
         return PF_Err_NONE;
     }

@@ -103,4 +103,21 @@ bool set_models_dir(const std::string& plugin_dir, const std::string& dir) {
     return (bool)f;
 }
 
+bool set_replacement_sound(const std::string& plugin_dir, const std::string& path) {
+    std::string p1 = join(plugin_dir, "NwRemover.json");
+    std::string p2 = "D:/AEplugin/NwRemover.json";
+    std::string p = file_exists(p1) ? p1 : p2;
+    nlohmann::json j = nlohmann::json::object();
+    std::string body = read_file(p);
+    if (!body.empty()) {
+        auto parsed = nlohmann::json::parse(body, nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) j = parsed;
+    }
+    j["replacement_sound"] = path;
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f << j.dump(2) << "\n";
+    return (bool)f;
+}
+
 } // namespace mc

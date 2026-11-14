@@ -47,6 +47,8 @@ target_link_libraries(NwRemover PRIVATE
   -Wl,--end-group
   winhttp
   ole32
+  comdlg32
+  shell32
 )
 target_link_options(NwRemover PRIVATE -static -static-libgcc -static-libstdc++ -fopenmp)
 
