@@ -143,10 +143,13 @@ static std::wstring to_wide(const std::string& s) {
 static const char* kLanguages[] = {"auto","ru","en","uk","be","de","fr","es","it","pl","tr","ja","ko","zh"};
 static const char* kGroqModels[] = {"", "whisper-large-v3", "whisper-large-v3-turbo"};
 static const char* kModelNames[] = {"tiny","base","small","medium","large-v3"};
+// Approximate ggml sizes, used for progress when Content-Length is absent.
+static const uint64_t kModelSizes[] = {77691713ULL, 147951465ULL, 466000000ULL, 1500000000ULL, 3100000000ULL};
 
-// Stream a HTTPS file to disk with progress (percent) and cancel. Returns "" on success.
+// Stream a HTTPS file to disk with progress (percent, bytes) and cancel. Returns "" on success.
 static std::string download_model_file(const std::string& url, const std::string& dest,
-                                       const std::function<void(int)>& prog,
+                                       uint64_t expected,
+                                       const std::function<void(int, uint64_t)>& prog,
                                        const std::function<bool()>& cancel) {
     std::string host, path;
     {
@@ -188,6 +191,8 @@ static std::string download_model_file(const std::string& url, const std::string
             DWORD total = 0; sz = sizeof(total);
             WinHttpQueryHeaders(hR, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
                                 WINHTTP_HEADER_NAME_BY_INDEX, &total, &sz, WINHTTP_NO_HEADER_INDEX);
+            uint64_t denom = (total > 0) ? (uint64_t)total : expected;
+            if (denom == 0) denom = 1;
             std::ofstream f(dest, std::ios::binary | std::ios::trunc);
             if (!f) { err = "cannot write " + dest; }
             else {
@@ -199,11 +204,11 @@ static std::string download_model_file(const std::string& url, const std::string
                     if (!WinHttpReadData(hR, buf.data(), (DWORD)buf.size(), &rd) || rd == 0) break;
                     f.write(buf.data(), rd);
                     got += rd;
-                    if (total > 0) prog((int)(got * 100 / total));
+                    prog((int)(got * 100 / denom), got);
                 }
                 f.close();
                 if (err.empty() && total > 0 && got != total) err = "incomplete download";
-                if (err.empty()) prog(100);
+                if (err.empty()) prog(100, got);
             }
         }
     } else {
@@ -1207,16 +1212,20 @@ static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data,
         update_param_name(in_data, params, P_STATUS, "Status: downloading...");
         update_slider_value(in_data, params, P_PROGRESS, 0);
         std::atomic<int> pct{0};
+        std::atomic<uint64_t> got{0};
         std::atomic<bool> done{false}, cancel{false};
+        uint64_t expected = (mi >= 1 && mi <= 5) ? kModelSizes[mi - 1] : kModelSizes[1];
         std::string derr;
         std::thread th([&]{
-            derr = download_model_file(url, dest, [&](int p){ pct.store(p); },
+            derr = download_model_file(url, dest, expected,
+                                       [&](int p, uint64_t g){ pct.store(p); got.store(g); },
                                        [&]()->bool { return cancel.load(); });
             done.store(true);
         });
         while (!done.load()) {
-            char sb[64];
-            std::snprintf(sb, sizeof(sb), "Status: downloading %d%%", pct.load());
+            char sb[96];
+            std::snprintf(sb, sizeof(sb), "Status: downloading %d%% (%llu MB)",
+                          pct.load(), (unsigned long long)(got.load() / 1048576));
             update_param_name(in_data, params, P_STATUS, sb);
             update_slider_value(in_data, params, P_PROGRESS, (float)pct.load());
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
