@@ -574,7 +574,7 @@ static void apply_cuts_to_timeline(PF_InData* in_data, PF_ParamDef* params[],
     float vol = params[P_TL_VOL]->u.fs_d.value;
 
     std::string combined;
-    if (layout == 1) {
+    if (layout == 1 && p.mode != mc::MODE_MUTE) {
         std::string cw = dir + "/combined.wav";
         if (generate_combined_wav(cw, p.mode, p, cuts, mono16k, cfg, dur)) {
             combined = cw;
@@ -1089,7 +1089,7 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_END_TOPIC(P_END_DETECT);
 
     PF_ADD_TOPIC("Replacement", P_TOPIC_REPLACE);
-    PF_ADD_POPUP("Replace with", 6, 1, "Beep|Silence|Reverse|Pitch shift|Custom sound|Repeat (prev audio)", P_MODE);
+    PF_ADD_POPUP("Replace with", 6, 2, "Beep|Silence|Reverse|Pitch shift|Custom sound|Repeat (prev audio)", P_MODE);
     PF_ADD_FLOAT_SLIDER("Beep freq (Hz)", 100, 4000, 100, 4000, 0, 1000, 1, 0, FALSE, P_BEEP_FREQ);
     PF_ADD_FLOAT_SLIDER("Replacement level", 0, 1, 0, 1, 0, 0.25f, 2, 0, FALSE, P_BEEP_LEVEL);
     PF_ADD_POPUP("Beep wave", 3, 1, "sine|square|saw", P_BEEP_WAVE);
