@@ -2,7 +2,6 @@
 // whisper.cpp or Groq API. Platform presets, custom replacement sound, manual mute.
 #include <windows.h>
 #include <shlobj.h>
-#include <shellapi.h>
 #include <commdlg.h>
 #include <winhttp.h>
 #include <string>
@@ -632,6 +631,8 @@ try{
     function piece(s,e,bad){
         var dup=target.duplicate();
         dup.inPoint=s; dup.outPoint=e; dup.startTime=s;
+        var ep=dup.property("ADBE Effect Parade");
+        while(ep && ep.numProperties>0){ ep.property(1).remove(); }
         if(bad){
             nbad++; dup.name="NwBad_"+nbad;
             if(orig==2){ dup.audioEnabled=false; }
@@ -1084,7 +1085,7 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     PF_ADD_TOPIC("Detection", P_TOPIC_DETECT);
     PF_ADD_POPUP("Platform preset", 5, 1, "Custom|YouTube|TikTok|Reels|Twitch", P_PLATFORM);
     PF_ADD_SLIDER("Strictness (custom)", 1, 3, 1, 3, 3, P_STRICTNESS);
-    PF_ADD_SLIDER("Padding (ms)", 0, 500, 0, 500, 80, P_PAD_MS);
+    PF_ADD_SLIDER("Padding (ms)", 0, 500, 0, 500, 0, P_PAD_MS);
     PF_ADD_SLIDER("Merge gap (ms)", 0, 1000, 0, 1000, 150, P_MERGE_MS);
     PF_END_TOPIC(P_END_DETECT);
 
